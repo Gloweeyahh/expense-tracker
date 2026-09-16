@@ -1,216 +1,267 @@
 /**
- * expense-tracker — plain Node `http` + `node:sqlite`. No framework,
- * no ORM, no auth library — see README for the reasoning throughout.
+ * Starts the real server on a random free port and talks to it with
+ * real HTTP requests via Node's built-in fetch. Two tests in here
+ * matter more than the rest: "a user cannot read or write another
+ * user's expense" and "the same create request sent twice leaves one
+ * row" — both are exactly what this brief is checking for, so both
+ * go through the actual HTTP layer end to end, not just the store
+ * functions underneath it.
  */
 
-const http = require('http');
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
+
+const TEST_DB_PATH = path.join(__dirname, 'data', 'test-server.db');
+process.env.DB_PATH = TEST_DB_PATH;
+for (const suffix of ['', '-wal', '-shm']) fs.rmSync(TEST_DB_PATH + suffix, { force: true });
+
+const server = require('./server');
 const { openDatabase } = require('./db');
-const { hashPassword, verifyPassword, generateToken, hashToken, SESSION_LIFETIME_MS } = require('./auth');
-const {
-  validateSignupBody, validateLoginBody, validateExpenseBody, validateIdempotencyKey,
-} = require('./validate');
-const store = require('./store');
+const { generateToken, hashToken } = require('./auth');
 
-const PORT = process.env.PORT || 3000;
-const db = openDatabase();
+let baseUrl;
 
-function sendJson(res, status, body) {
-  const json = JSON.stringify(body);
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
-  res.end(json);
+test.before(() => new Promise((resolve) => {
+  server.listen(0, () => {
+    baseUrl = `http://localhost:${server.address().port}`;
+    resolve();
+  });
+}));
+
+test.after(() => new Promise((resolve) => server.close(resolve)));
+
+function req(p, options = {}) {
+  return fetch(baseUrl + p, options);
 }
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on('data', (chunk) => {
-      size += chunk.length;
-      if (size > 100_000) {
-        reject(Object.assign(new Error('body too large'), { code: 'BODY_TOO_LARGE' }));
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
+function postJson(p, body, extraHeaders = {}) {
+  return req(p, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
+    body: JSON.stringify(body),
   });
 }
-
-async function readJsonBody(req) {
-  let raw;
-  try {
-    raw = await readBody(req);
-  } catch {
-    return { error: { field: 'body', message: 'request body is too large or unreadable' } };
-  }
-  try {
-    return { value: raw.length ? JSON.parse(raw) : {} };
-  } catch {
-    return { error: { field: 'body', message: 'request body must be valid JSON' } };
-  }
+async function signup(email, password = 'a-good-password') {
+  const res = await postJson('/signup', { email, password });
+  const body = await res.json();
+  return { token: body.token, userId: body.user.id, status: res.status };
+}
+function authed(token) {
+  return { Authorization: `Bearer ${token}` };
 }
 
-/**
- * Extracts and validates the bearer token. Returns a user id on
- * success. On failure, sends the 401 itself and returns null — every
- * protected route just does `if (!userId) return;` after calling
- * this, so there's exactly one place unauthenticated access is
- * rejected, not one check per route that could be forgotten.
- */
-function requireAuth(req, res) {
-  const header = req.headers['authorization'];
-  if (typeof header !== 'string' || !header.startsWith('Bearer ')) {
-    sendJson(res, 401, { field: 'authorization', message: 'missing or malformed Authorization header — expected "Bearer <token>"' });
-    return null;
-  }
-  const token = header.slice('Bearer '.length).trim();
-  if (!token) {
-    sendJson(res, 401, { field: 'authorization', message: 'missing or malformed Authorization header — expected "Bearer <token>"' });
-    return null;
-  }
-  const userId = store.findUserIdByTokenHash(db, hashToken(token));
-  if (!userId) {
-    sendJson(res, 401, { field: 'authorization', message: 'token is invalid or expired — log in again' });
-    return null;
-  }
-  return userId;
-}
-
-function isPositiveInteger(value) {
-  return /^[1-9][0-9]*$/.test(value);
-}
-
-async function handleRequest(req, res) {
-  const { pathname } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const parts = pathname.split('/').filter(Boolean);
-
-  if (pathname === '/' && req.method === 'GET') {
-    return sendJson(res, 200, {
-      service: 'expense-tracker',
-      status: 'ok',
-      endpoints: ['POST /signup', 'POST /login', 'GET /expenses', 'POST /expenses', 'GET /expenses/:id', 'DELETE /expenses/:id'],
-    });
-  }
-
-  if (pathname === '/signup' && req.method === 'POST') {
-    const { value: body, error } = await readJsonBody(req);
-    if (error) return sendJson(res, 400, error);
-
-    const validationError = validateSignupBody(body);
-    if (validationError) return sendJson(res, 400, validationError);
-
-    if (store.findUserByEmail(db, body.email)) {
-      return sendJson(res, 409, { field: 'email', message: 'an account with this email already exists' });
-    }
-
-    const { hash, salt } = hashPassword(body.password);
-    const user = store.createUser(db, { email: body.email, passwordHash: hash, passwordSalt: salt });
-
-    const token = generateToken();
-    const expiresAt = new Date(Date.now() + SESSION_LIFETIME_MS).toISOString();
-    store.createSession(db, user.id, hashToken(token), expiresAt);
-
-    return sendJson(res, 201, { token, user });
-  }
-
-  if (pathname === '/login' && req.method === 'POST') {
-    const { value: body, error } = await readJsonBody(req);
-    if (error) return sendJson(res, 400, error);
-
-    const validationError = validateLoginBody(body);
-    if (validationError) return sendJson(res, 400, validationError);
-
-    const userRow = store.findUserByEmail(db, body.email);
-    // Deliberately the same generic message whether the email doesn't
-    // exist or the password is wrong — see README, "Why the login
-    // error doesn't name a field," for why this is the one place in
-    // the app that departs from naming the exact field.
-    const invalidCredentials = { message: 'email or password is incorrect' };
-    if (!userRow) return sendJson(res, 401, invalidCredentials);
-
-    const valid = verifyPassword(body.password, userRow.password_hash, userRow.password_salt);
-    if (!valid) return sendJson(res, 401, invalidCredentials);
-
-    const token = generateToken();
-    const expiresAt = new Date(Date.now() + SESSION_LIFETIME_MS).toISOString();
-    store.createSession(db, userRow.id, hashToken(token), expiresAt);
-
-    return sendJson(res, 200, { token, user: { id: userRow.id, email: userRow.email } });
-  }
-
-  if (pathname === '/expenses' && req.method === 'GET') {
-    const userId = requireAuth(req, res);
-    if (!userId) return;
-    return sendJson(res, 200, { expenses: store.listExpenses(db, userId) });
-  }
-
-  if (pathname === '/expenses' && req.method === 'POST') {
-    const userId = requireAuth(req, res);
-    if (!userId) return;
-
-    const idempotencyCheck = validateIdempotencyKey(req.headers['idempotency-key']);
-    if (idempotencyCheck.error) {
-      return sendJson(res, 400, { field: 'Idempotency-Key', message: idempotencyCheck.error });
-    }
-
-    const { value: body, error } = await readJsonBody(req);
-    if (error) return sendJson(res, 400, error);
-
-    const validationError = validateExpenseBody(body);
-    if (validationError) return sendJson(res, 400, validationError);
-
-    const { expense, created } = store.createExpense(db, userId, {
-      description: body.description,
-      amountCents: body.amount_cents,
-      paidAt: body.paid_at,
-      idempotencyKey: idempotencyCheck.value,
-    });
-    return sendJson(res, created ? 201 : 200, expense);
-  }
-
-  if (parts.length === 2 && parts[0] === 'expenses') {
-    const userId = requireAuth(req, res);
-    if (!userId) return;
-
-    const idParam = parts[1];
-    if (!isPositiveInteger(idParam)) {
-      return sendJson(res, 400, { field: 'id', message: 'expense id must be a positive integer' });
-    }
-    const id = Number(idParam);
-
-    if (req.method === 'GET') {
-      const expense = store.getExpense(db, userId, id);
-      if (!expense) return sendJson(res, 404, { message: 'expense not found' });
-      return sendJson(res, 200, expense);
-    }
-
-    if (req.method === 'DELETE') {
-      const deleted = store.deleteExpense(db, userId, id);
-      if (!deleted) return sendJson(res, 404, { message: 'expense not found' });
-      res.writeHead(204);
-      return res.end();
-    }
-
-    return sendJson(res, 405, { message: `method ${req.method} not allowed on /expenses/:id` });
-  }
-
-  return sendJson(res, 404, { message: 'not found' });
-}
-
-const server = http.createServer((req, res) => {
-  handleRequest(req, res).catch((err) => {
-    console.error(err);
-    if (!res.headersSent) {
-      sendJson(res, 400, { field: null, message: 'request could not be processed' });
-    }
-  });
+test('GET / returns 200 with service info', async () => {
+  const res = await req('/');
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).service, 'expense-tracker');
 });
 
-if (require.main === module) {
-  server.listen(PORT, () => {
-    console.log(`expense-tracker listening on port ${PORT}`);
-  });
-}
+test('GET /expenses with no Authorization header returns 401', async () => {
+  const res = await req('/expenses');
+  assert.equal(res.status, 401);
+  const body = await res.json();
+  assert.equal(body.field, 'authorization');
+});
 
-module.exports = server;
+test('GET /expenses with a garbage token returns 401, not 500', async () => {
+  const res = await req('/expenses', { headers: authed('not-a-real-token') });
+  assert.equal(res.status, 401);
+});
+
+test('GET /expenses with a malformed Authorization header (no "Bearer ") returns 401', async () => {
+  const res = await req('/expenses', { headers: { Authorization: 'not-bearer-format' } });
+  assert.equal(res.status, 401);
+});
+
+test('signing up creates an account and returns a usable token', async () => {
+  const { token, status } = await signup('newuser1@example.com');
+  assert.equal(status, 201);
+  const res = await req('/expenses', { headers: authed(token) });
+  assert.equal(res.status, 200);
+});
+
+test('signing up with an email already in use returns 409, naming the field', async () => {
+  await signup('taken@example.com');
+  const res = await postJson('/signup', { email: 'taken@example.com', password: 'another-password' });
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).field, 'email');
+});
+
+test('signing up with a short password returns 400, naming the field', async () => {
+  const res = await postJson('/signup', { email: 'shortpw@example.com', password: 'short' });
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).field, 'password');
+});
+
+test('logging in with correct credentials returns a token', async () => {
+  await postJson('/signup', { email: 'logintest@example.com', password: 'correct-password' });
+  const res = await postJson('/login', { email: 'logintest@example.com', password: 'correct-password' });
+  assert.equal(res.status, 200);
+  assert.ok((await res.json()).token);
+});
+
+test('logging in with the wrong password returns 401 with a generic message (not naming a field)', async () => {
+  await postJson('/signup', { email: 'wrongpw@example.com', password: 'correct-password' });
+  const res = await postJson('/login', { email: 'wrongpw@example.com', password: 'incorrect-password' });
+  assert.equal(res.status, 401);
+  const body = await res.json();
+  assert.equal(body.field, undefined);
+  assert.match(body.message, /incorrect/);
+});
+
+test('logging in with an email that was never registered returns the SAME 401 message as a wrong password', async () => {
+  const res = await req('/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'never-registered@example.com', password: 'whatever' }),
+  });
+  assert.equal(res.status, 401);
+  const body = await res.json();
+  assert.match(body.message, /incorrect/);
+});
+
+test('an expired session token is rejected with 401, not treated as valid', async () => {
+  // There's no API to create an expired session directly — signing up
+  // always issues one that's fresh. So this crafts one by hand: a real
+  // user, a real token, but a session row whose expires_at is already
+  // in the past, inserted straight into the database the same way
+  // store.createSession() would, just with a backdated expiry.
+  const { userId } = await signup('expiring-session@example.com');
+  const token = generateToken();
+  const db = openDatabase(TEST_DB_PATH);
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  db.prepare('INSERT INTO sessions (user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?)')
+    .run(userId, hashToken(token), yesterday, yesterday);
+  db.close();
+
+  const res = await req('/expenses', { headers: authed(token) });
+  assert.equal(res.status, 401);
+  assert.equal((await res.json()).field, 'authorization');
+});
+
+test('POST /expenses without an Idempotency-Key header returns 400 naming that field', async () => {
+  const { token } = await signup('noidempkey@example.com');
+  const res = await postJson('/expenses', { description: 'Coffee', amount_cents: 450, paid_at: '2026-09-15' }, authed(token));
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).field, 'Idempotency-Key');
+});
+
+test('POST /expenses with an invalid body returns 400 naming the field', async () => {
+  const { token } = await signup('badbody@example.com');
+  const res = await postJson('/expenses', { amount_cents: 450, paid_at: '2026-09-15' }, { ...authed(token), 'Idempotency-Key': 'k1' });
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).field, 'description');
+});
+
+test('creating an expense returns 201 with the created row', async () => {
+  const { token } = await signup('create1@example.com');
+  const res = await postJson(
+    '/expenses',
+    { description: 'Groceries', amount_cents: 5600, paid_at: '2026-09-15' },
+    { ...authed(token), 'Idempotency-Key': 'grocery-key-1' }
+  );
+  assert.equal(res.status, 201);
+  const body = await res.json();
+  assert.equal(body.description, 'Groceries');
+  assert.equal(body.amount_cents, 5600);
+});
+
+test('THE RETRY-SAFETY TEST: sending the same create request twice (same Idempotency-Key) leaves one row', async () => {
+  const { token } = await signup('retrytest@example.com');
+  const payload = { description: 'Rent', amount_cents: 150000, paid_at: '2026-09-01' };
+  const headers = { ...authed(token), 'Idempotency-Key': 'rent-september' };
+
+  const first = await postJson('/expenses', payload, headers);
+  const second = await postJson('/expenses', payload, headers);
+
+  assert.equal(first.status, 201);
+  assert.equal(second.status, 200);
+
+  const firstBody = await first.json();
+  const secondBody = await second.json();
+  assert.equal(firstBody.id, secondBody.id);
+
+  const list = await (await req('/expenses', { headers: authed(token) })).json();
+  const matching = list.expenses.filter((e) => e.description === 'Rent');
+  assert.equal(matching.length, 1);
+});
+
+test('THE CROSS-USER ISOLATION TEST: one user cannot read another user\'s expense', async () => {
+  const alice = await signup('alice-isolation@example.com');
+  const bob = await signup('bob-isolation@example.com');
+
+  const created = await postJson(
+    '/expenses',
+    { description: "Alice's private expense", amount_cents: 999, paid_at: '2026-09-15' },
+    { ...authed(alice.token), 'Idempotency-Key': 'alice-private-1' }
+  );
+  const aliceExpense = await created.json();
+
+  // Bob, with his own VALID token, tries to read Alice's expense by id.
+  const bobReadsAlices = await req(`/expenses/${aliceExpense.id}`, { headers: authed(bob.token) });
+  assert.equal(bobReadsAlices.status, 404); // not 403 — see README for why
+
+  // Bob's own list must not contain it either.
+  const bobsList = await (await req('/expenses', { headers: authed(bob.token) })).json();
+  assert.ok(!bobsList.expenses.some((e) => e.id === aliceExpense.id));
+
+  // Alice can still read her own.
+  const aliceReadsOwn = await req(`/expenses/${aliceExpense.id}`, { headers: authed(alice.token) });
+  assert.equal(aliceReadsOwn.status, 200);
+});
+
+test('THE CROSS-USER ISOLATION TEST, part two: one user cannot delete another user\'s expense', async () => {
+  const alice = await signup('alice-delete-test@example.com');
+  const bob = await signup('bob-delete-test@example.com');
+
+  const created = await postJson(
+    '/expenses',
+    { description: "Alice's expense, attempted deletion", amount_cents: 100, paid_at: '2026-09-15' },
+    { ...authed(alice.token), 'Idempotency-Key': 'alice-delete-1' }
+  );
+  const aliceExpense = await created.json();
+
+  const bobDeletesAlices = await req(`/expenses/${aliceExpense.id}`, { method: 'DELETE', headers: authed(bob.token) });
+  assert.equal(bobDeletesAlices.status, 404);
+
+  // It's still there, and Alice can still see it.
+  const stillThere = await req(`/expenses/${aliceExpense.id}`, { headers: authed(alice.token) });
+  assert.equal(stillThere.status, 200);
+});
+
+test('a user CAN delete their own expense', async () => {
+  const { token } = await signup('ownscope-delete@example.com');
+  const created = await postJson(
+    '/expenses',
+    { description: 'To be deleted', amount_cents: 100, paid_at: '2026-09-15' },
+    { ...authed(token), 'Idempotency-Key': 'own-delete-1' }
+  );
+  const expense = await created.json();
+
+  const del = await req(`/expenses/${expense.id}`, { method: 'DELETE', headers: authed(token) });
+  assert.equal(del.status, 204);
+
+  const after = await req(`/expenses/${expense.id}`, { headers: authed(token) });
+  assert.equal(after.status, 404);
+});
+
+test('malformed JSON body returns 400, not 500', async () => {
+  const { token } = await signup('malformedjson@example.com');
+  const res = await req('/expenses', {
+    method: 'POST',
+    headers: { ...authed(token), 'Content-Type': 'application/json', 'Idempotency-Key': 'k1' },
+    body: '{not valid json',
+  });
+  assert.equal(res.status, 400);
+});
+
+test('a malformed expense id returns 400, not 500', async () => {
+  const { token } = await signup('badid@example.com');
+  const res = await req('/expenses/not-a-number', { headers: authed(token) });
+  assert.equal(res.status, 400);
+});
+
+test('an unknown route returns 404, not 500', async () => {
+  const res = await req('/definitely/not/a/route');
+  assert.equal(res.status, 404);
+});
