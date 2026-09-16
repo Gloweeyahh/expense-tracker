@@ -18,6 +18,8 @@ process.env.DB_PATH = TEST_DB_PATH;
 for (const suffix of ['', '-wal', '-shm']) fs.rmSync(TEST_DB_PATH + suffix, { force: true });
 
 const server = require('./server');
+const { openDatabase } = require('./db');
+const { generateToken, hashToken } = require('./auth');
 
 let baseUrl;
 
@@ -116,6 +118,25 @@ test('logging in with an email that was never registered returns the SAME 401 me
   assert.equal(res.status, 401);
   const body = await res.json();
   assert.match(body.message, /incorrect/);
+});
+
+test('an expired session token is rejected with 401, not treated as valid', async () => {
+  // There's no API to create an expired session directly — signing up
+  // always issues one that's fresh. So this crafts one by hand: a real
+  // user, a real token, but a session row whose expires_at is already
+  // in the past, inserted straight into the database the same way
+  // store.createSession() would, just with a backdated expiry.
+  const { userId } = await signup('expiring-session@example.com');
+  const token = generateToken();
+  const db = openDatabase(TEST_DB_PATH);
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  db.prepare('INSERT INTO sessions (user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?)')
+    .run(userId, hashToken(token), yesterday, yesterday);
+  db.close();
+
+  const res = await req('/expenses', { headers: authed(token) });
+  assert.equal(res.status, 401);
+  assert.equal((await res.json()).field, 'authorization');
 });
 
 test('POST /expenses without an Idempotency-Key header returns 400 naming that field', async () => {
@@ -230,6 +251,25 @@ test('malformed JSON body returns 400, not 500', async () => {
     method: 'POST',
     headers: { ...authed(token), 'Content-Type': 'application/json', 'Idempotency-Key': 'k1' },
     body: '{not valid json',
+  });
+  assert.equal(res.status, 400);
+});
+
+test('an oversized request body on POST /expenses returns 400, not a hang or a 500', async () => {
+  const { token } = await signup('oversized-expense@example.com');
+  const hugeDescription = 'x'.repeat(200_000); // server.js caps the raw body at 100,000 bytes
+  const res = await postJson(
+    '/expenses',
+    { description: hugeDescription, amount_cents: 100, paid_at: '2026-09-15' },
+    { ...authed(token), 'Idempotency-Key': 'oversize-1' }
+  );
+  assert.equal(res.status, 400);
+});
+
+test('an oversized request body on POST /signup returns 400, not a hang or a 500', async () => {
+  const res = await postJson('/signup', {
+    email: 'oversized-signup@example.com',
+    password: 'x'.repeat(200_000),
   });
   assert.equal(res.status, 400);
 });
