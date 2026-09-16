@@ -10,7 +10,7 @@ Plain Node, using the built-in `node:sqlite` module. No framework, no
 ORM, no auth library, no password-hashing package — see "No secret is
 committed" below for why that's not just a style preference here.
 
-**Live URL:** _add your deployed Render URL here before submitting_
+**Live URL:** https://expense-tracker-mu2q.onrender.com/
 
 ## Endpoints
 
